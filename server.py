@@ -55,19 +55,105 @@ LAYER_WEIGHTS = {
 #  STORE JSON (persistance locale)
 # ════════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════════
+#  STORE — Supabase PostgreSQL si DATABASE_URL défini, JSON sinon
+# ════════════════════════════════════════════════════════════════
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
 DATA_DIR     = Path("data_store")
 DATA_DIR.mkdir(exist_ok=True)
 ENTRIES_FILE = DATA_DIR / "entries.json"
 RESULTS_FILE = DATA_DIR / "results.json"
 STATS_FILE   = DATA_DIR / "stats.json"
 
+def _pg_connect():
+    """Connexion PostgreSQL via urllib (stdlib uniquement)."""
+    import urllib.parse as up
+    p = up.urlparse(DATABASE_URL)
+    import socket, ssl, struct, hashlib, hmac, base64, re
+    # On utilise le module http.client pour faire une requête REST vers Supabase
+    # Non — on utilise subprocess + psql si dispo, sinon on lève une exception
+    raise NotImplementedError("Utiliser pg_store directement")
+
+# ── Détection du driver PostgreSQL disponible ────────────────
+_PG_DRIVER = None
+try:
+    import urllib.request as _ur
+    # Test si psycopg2 est dispo
+    import psycopg2 as _pg
+    _PG_DRIVER = "psycopg2"
+    log.info("Driver PostgreSQL : psycopg2")
+except ImportError:
+    try:
+        import pg8000 as _pg
+        _PG_DRIVER = "pg8000"
+        log.info("Driver PostgreSQL : pg8000")
+    except ImportError:
+        log.info("Aucun driver PostgreSQL — mode JSON local")
+
+def _get_pg_conn():
+    """Retourne une connexion PostgreSQL."""
+    import urllib.parse as up
+    p = up.urlparse(DATABASE_URL)
+    host = p.hostname
+    port = p.port or 5432
+    db   = p.path.lstrip("/")
+    user = p.username
+    pwd  = p.password
+    if _PG_DRIVER == "psycopg2":
+        import psycopg2
+        return psycopg2.connect(host=host, port=port, dbname=db, user=user,
+                                password=pwd, sslmode="require", connect_timeout=8)
+    else:
+        import pg8000
+        return pg8000.connect(host=host, port=port, database=db, user=user,
+                              password=pwd, ssl_context=True, timeout=8)
+
+def _pg_init():
+    """Crée les tables si elles n'existent pas."""
+    try:
+        conn = _get_pg_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS mv_entries (
+                id          TEXT PRIMARY KEY,
+                data        JSONB NOT NULL,
+                region      TEXT,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS mv_results (
+                entry_id    TEXT PRIMARY KEY,
+                data        JSONB NOT NULL,
+                agric_score REAL,
+                zone        TEXT,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_mv_entries_region ON mv_entries(region);
+            CREATE INDEX IF NOT EXISTS idx_mv_results_score  ON mv_results(agric_score);
+        """)
+        conn.commit()
+        cur.close(); conn.close()
+        log.info("✅ Supabase PostgreSQL initialisé")
+        return True
+    except Exception as e:
+        log.warning(f"Supabase init échoué : {e} — fallback JSON")
+        return False
+
+# Détermine le mode storage
+USE_PG = bool(DATABASE_URL) and _PG_DRIVER is not None and _pg_init()
+log.info(f"Storage : {'Supabase PostgreSQL' if USE_PG else 'JSON local'}")
+
+
 class Store:
     def __init__(self):
         self._lock = threading.Lock()
-        for f, d in [(ENTRIES_FILE, []), (RESULTS_FILE, {}), (STATS_FILE, {})]:
-            if not f.exists():
-                f.write_text(json.dumps(d, ensure_ascii=False), "utf-8")
+        if not USE_PG:
+            for f, d in [(ENTRIES_FILE, []), (RESULTS_FILE, {}), (STATS_FILE, {})]:
+                if not f.exists():
+                    f.write_text(json.dumps(d, ensure_ascii=False), "utf-8")
 
+    # ── JSON local helpers ────────────────────────
     def _r(self, f):
         try:
             if f.exists() and f.stat().st_size > 2:
@@ -80,43 +166,132 @@ class Store:
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), "utf-8")
         tmp.replace(f)
 
+    # ── save_entry ────────────────────────────────
     def save_entry(self, e: dict) -> str:
+        eid = e.get("id") or "MVY-" + str(uuid.uuid4())[:8].upper()
+        e["id"] = eid
+        e["_at"] = datetime.utcnow().isoformat()
+        if USE_PG:
+            try:
+                conn = _get_pg_conn(); cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO mv_entries (id, data, region) VALUES (%s, %s::jsonb, %s) ON CONFLICT (id) DO NOTHING",
+                    (eid, json.dumps(e, default=str), e.get("region",""))
+                )
+                conn.commit(); cur.close(); conn.close()
+                return eid
+            except Exception as ex:
+                log.error(f"PG save_entry: {ex}")
+        # fallback JSON
         with self._lock:
             entries = self._r(ENTRIES_FILE)
-            eid = e.get("id") or "MVY-" + str(uuid.uuid4())[:8].upper()
-            e["id"] = eid
-            e["_at"] = datetime.utcnow().isoformat()
             entries.append(e)
             self._w(ENTRIES_FILE, entries[-2000:])
-            return eid
+        return eid
 
+    # ── save_result ───────────────────────────────
     def save_result(self, eid: str, result: dict):
+        result["_at"] = datetime.utcnow().isoformat()
+        if USE_PG:
+            try:
+                conn = _get_pg_conn(); cur = conn.cursor()
+                cur.execute(
+                    """INSERT INTO mv_results (entry_id, data, agric_score, zone)
+                       VALUES (%s, %s::jsonb, %s, %s)
+                       ON CONFLICT (entry_id) DO UPDATE
+                       SET data=EXCLUDED.data, agric_score=EXCLUDED.agric_score, zone=EXCLUDED.zone""",
+                    (eid, json.dumps(result, default=str),
+                     result.get("agric_score"), result.get("zone"))
+                )
+                conn.commit(); cur.close(); conn.close()
+                return
+            except Exception as ex:
+                log.error(f"PG save_result: {ex}")
         with self._lock:
             results = self._r(RESULTS_FILE)
-            results[eid] = {**result, "_at": datetime.utcnow().isoformat()}
+            results[eid] = result
             self._w(RESULTS_FILE, results)
 
+    # ── get_entry ─────────────────────────────────
     def get_entry(self, eid: str):
+        if USE_PG:
+            try:
+                conn = _get_pg_conn(); cur = conn.cursor()
+                cur.execute("SELECT data FROM mv_entries WHERE id=%s", (eid,))
+                row = cur.fetchone(); cur.close(); conn.close()
+                return row[0] if row else None
+            except Exception as ex:
+                log.error(f"PG get_entry: {ex}")
         with self._lock:
             return next((e for e in self._r(ENTRIES_FILE) if e.get("id") == eid), None)
 
+    # ── get_result ────────────────────────────────
     def get_result(self, eid: str):
+        if USE_PG:
+            try:
+                conn = _get_pg_conn(); cur = conn.cursor()
+                cur.execute("SELECT data FROM mv_results WHERE entry_id=%s", (eid,))
+                row = cur.fetchone(); cur.close(); conn.close()
+                return row[0] if row else None
+            except Exception as ex:
+                log.error(f"PG get_result: {ex}")
         with self._lock:
             return self._r(RESULTS_FILE).get(eid)
 
+    # ── list_entries ──────────────────────────────
     def list_entries(self, limit=50, region=None):
+        if USE_PG:
+            try:
+                conn = _get_pg_conn(); cur = conn.cursor()
+                if region:
+                    cur.execute("SELECT data FROM mv_entries WHERE region=%s ORDER BY created_at DESC LIMIT %s", (region, limit))
+                else:
+                    cur.execute("SELECT data FROM mv_entries ORDER BY created_at DESC LIMIT %s", (limit,))
+                rows = [r[0] for r in cur.fetchall()]
+                cur.close(); conn.close()
+                return rows
+            except Exception as ex:
+                log.error(f"PG list_entries: {ex}")
         with self._lock:
             all_e = self._r(ENTRIES_FILE)
         if region:
             all_e = [e for e in all_e if e.get("region","").lower() == region.lower()]
         return sorted(all_e, key=lambda x: x.get("_at",""), reverse=True)[:limit]
 
+    # ── count ─────────────────────────────────────
     def count(self) -> int:
+        if USE_PG:
+            try:
+                conn = _get_pg_conn(); cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM mv_entries")
+                n = cur.fetchone()[0]; cur.close(); conn.close()
+                return n
+            except Exception as ex:
+                log.error(f"PG count: {ex}")
         with self._lock:
             return len(self._r(ENTRIES_FILE))
 
+    # ── regional_avg ──────────────────────────────
     def regional_avg(self, region: str) -> dict:
-        """Score moyen par région — utilisé pour la comparaison M'vaye."""
+        if USE_PG:
+            try:
+                conn = _get_pg_conn(); cur = conn.cursor()
+                cur.execute("""
+                    SELECT COUNT(*), AVG(r.agric_score), MIN(r.agric_score), MAX(r.agric_score)
+                    FROM mv_results r
+                    JOIN mv_entries e ON e.id = r.entry_id
+                    WHERE e.region = %s AND r.agric_score IS NOT NULL
+                """, (region,))
+                row = cur.fetchone(); cur.close(); conn.close()
+                n = row[0] or 0
+                if n < 3:
+                    return {"available": False, "n": n, "min_required": 3}
+                return {"available": True, "n": n,
+                        "avg": round(float(row[1]),1),
+                        "min": round(float(row[2]),1),
+                        "max": round(float(row[3]),1)}
+            except Exception as ex:
+                log.error(f"PG regional_avg: {ex}")
         with self._lock:
             results = self._r(RESULTS_FILE)
             entries = self._r(ENTRIES_FILE)
@@ -125,15 +300,34 @@ class Store:
                   if eid in results and results[eid].get("agric_score")]
         if len(scores) < 3:
             return {"available": False, "n": len(scores), "min_required": 3}
-        return {
-            "available": True,
-            "n": len(scores),
-            "avg": round(sum(scores) / len(scores), 1),
-            "min": round(min(scores), 1),
-            "max": round(max(scores), 1),
-        }
+        return {"available": True, "n": len(scores),
+                "avg": round(sum(scores)/len(scores),1),
+                "min": round(min(scores),1), "max": round(max(scores),1)}
 
     def metrics(self) -> dict:
+        if USE_PG:
+            try:
+                conn = _get_pg_conn(); cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM mv_entries")
+                total = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM mv_results")
+                total_r = cur.fetchone()[0]
+                cur.execute("SELECT region, COUNT(*) FROM mv_entries GROUP BY region")
+                regions = {r[0]: r[1] for r in cur.fetchall()}
+                cur.execute("SELECT zone, COUNT(*) FROM mv_results GROUP BY zone")
+                zones = {r[0]: r[1] for r in cur.fetchall()}
+                cur.execute("SELECT AVG(agric_score) FROM mv_results WHERE agric_score IS NOT NULL")
+                avg = cur.fetchone()[0]
+                cur.close(); conn.close()
+                return {
+                    "total_entries": total, "total_results": total_r,
+                    "by_region": regions, "by_zone": zones,
+                    "avg_agric_score": round(float(avg),1) if avg else None,
+                    "storage": "supabase",
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            except Exception as ex:
+                log.error(f"PG metrics: {ex}")
         with self._lock:
             entries = self._r(ENTRIES_FILE)
             results = self._r(RESULTS_FILE)
